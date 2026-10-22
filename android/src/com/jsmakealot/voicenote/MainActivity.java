@@ -409,6 +409,8 @@ public class MainActivity extends Activity {
 
     private void listenOnce() {
         if (!listening) return;
+        // 인식기가 확정 없이 끝난 경우를 대비해, 남아 있는 중간 결과를 문장으로 확정하고 새로 듣는다
+        sendSpeech("final", "");
         if (recognizer == null) {
             recognizer = recognizerService == null
                     ? SpeechRecognizer.createSpeechRecognizer(this)

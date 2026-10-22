@@ -633,6 +633,8 @@ window.__nativeSpeech = (type, text) => {
   if (!rec || rec.recog !== 'native') return;
   if (type === 'partial') {
     if (!text) return;
+    const prev = rec.interimText;
+    if (prev && !text.startsWith(prev.slice(0, Math.min(prev.length, 4)))) flushInterim();
     if (rec.pendingStart == null) rec.pendingStart = Math.max(0, elapsed() - 800);
     showInterim(text);
   } else if (type === 'final') {
