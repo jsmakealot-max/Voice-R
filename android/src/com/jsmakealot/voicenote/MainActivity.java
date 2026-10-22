@@ -83,6 +83,12 @@ public class MainActivity extends Activity {
     private boolean usePipe;                 // 인식기에 파이프로 소리를 넣는 중
     private boolean pipeProven;              // 파이프 방식이 이 기기에서 실제로 동작함
     private Runnable readyTimeout;
+    // 파이프 방식은 인식기가 말의 끝을 스스로 정하지 않으므로, 앱이 침묵을 보고 입력을 끊어 문장을 확정시킨다
+    private static final int SPEECH_PEAK = 700;          // 이보다 크면 말소리로 본다 (최대 32767)
+    private static final long PAUSE_MS = 1200, MAX_UTTERANCE_MS = 20000, SILENT_SESSION_MS = 30000;
+    private volatile long sessionStart, lastSpeechAt;
+    private volatile boolean speechSeen;
+    private int session;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -265,21 +271,25 @@ public class MainActivity extends Activity {
                 if (n <= 0) continue;
                 if (capturePaused) continue;
                 out.write(buf, 0, n);
+                int peak = 0;
+                for (int i = 0; i + 1 < n; i += 2) {
+                    int v = (short) ((buf[i] & 0xff) | (buf[i + 1] << 8));
+                    if (v < 0) v = -v;
+                    if (v > peak) peak = v;
+                }
+                long now = System.currentTimeMillis();
                 BlockingQueue<byte[]> q = feed;
                 if (q != null) {
                     byte[] copy = new byte[n];
                     System.arraycopy(buf, 0, copy, 0, n);
                     q.offer(copy); // 인식기가 못 따라오면 그냥 버린다 — 녹음이 멈추면 안 되니까
+                    if (peak > SPEECH_PEAK) { speechSeen = true; lastSpeechAt = now; }
+                    boolean pause = speechSeen && now - lastSpeechAt > PAUSE_MS;
+                    boolean tooLong = now - sessionStart > (speechSeen ? MAX_UTTERANCE_MS : SILENT_SESSION_MS);
+                    if (pause || tooLong) finishPipe();
                 }
-                long now = System.currentTimeMillis();
                 if (now - lastLevel >= 100) {
                     lastLevel = now;
-                    int peak = 0;
-                    for (int i = 0; i + 1 < n; i += 2) {
-                        int v = (short) ((buf[i] & 0xff) | (buf[i + 1] << 8));
-                        if (v < 0) v = -v;
-                        if (v > peak) peak = v;
-                    }
                     sendJs("__nativeLevel", String.valueOf(peak / 32768f), "");
                 }
             }
@@ -457,7 +467,26 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** 입력을 끊어(EOF) 인식기가 지금까지의 말을 확정하게 한다. 결과가 안 오면 잠시 후 다시 시작한다. */
+    private void finishPipe() {
+        if (feed == null) return;
+        feed = null;
+        final int id = session;
+        main.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (listening && session == id && feed == null) {
+                    sendSpeech("final", "");
+                    recreateAndRetry();
+                }
+            }
+        }, 4000);
+    }
+
     private void startFeeding() {
+        session++;
+        sessionStart = System.currentTimeMillis();
+        speechSeen = false;
         feed = new ArrayBlockingQueue<byte[]>(40);
         final BlockingQueue<byte[]> q = feed;
         final ParcelFileDescriptor w = pipeWrite;

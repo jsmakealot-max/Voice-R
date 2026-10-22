@@ -659,6 +659,8 @@ function showInterim(text) {
   el.querySelector('.ts').textContent = rec.pendingStart != null ? fmt(rec.pendingStart) : '';
   el.style.display = text ? '' : 'none';
   if (cur === rec.note && !el.isConnected) renderSegs();
+  const empty = $('#segs .empty'); // 중간 결과가 보이는 동안은 안내 문구를 숨긴다
+  if (empty) empty.style.display = text ? 'none' : '';
   if (text) el.scrollIntoView({ block: 'nearest' });
 }
 function flushInterim() {
