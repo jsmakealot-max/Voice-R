@@ -3,9 +3,11 @@ package com.jsmakealot.voicenote;
 import android.Manifest;
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
+import android.content.ComponentName;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -37,6 +39,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.ArrayList;
+import java.util.List;
 
 /** assets/www 의 웹앱을 보안 출처(https)로 띄우고 마이크·파일 선택·저장을 연결하는 화면. */
 public class MainActivity extends Activity {
@@ -53,7 +56,9 @@ public class MainActivity extends Activity {
     private boolean listening;
     private String speechLang = "ko-KR";
     private int audioErrors;
+    private int errorsInRow;
     private boolean musicMuted;
+    private ComponentName recognizerService;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -178,10 +183,26 @@ public class MainActivity extends Activity {
                 + JSONObject.quote(type) + "," + JSONObject.quote(text == null ? "" : text) + ")", null);
     }
 
+    /** 삼성 등 일부 기기의 기본 인식기는 말없이 실패하므로 Google 인식기가 있으면 그것을 쓴다. */
+    private ComponentName pickRecognizer() {
+        List<ResolveInfo> list = getPackageManager().queryIntentServices(new Intent("android.speech.RecognitionService"), 0);
+        ComponentName first = null;
+        for (ResolveInfo ri : list) {
+            ComponentName cn = new ComponentName(ri.serviceInfo.packageName, ri.serviceInfo.name);
+            if (first == null) first = cn;
+            if (ri.serviceInfo.packageName.equals("com.google.android.googlequicksearchbox")
+                    || ri.serviceInfo.packageName.equals("com.google.android.tts")) return cn;
+        }
+        return first;
+    }
+
     private void startListening(String lang) {
         speechLang = lang;
         listening = true;
         audioErrors = 0;
+        errorsInRow = 0;
+        recognizerService = pickRecognizer();
+        sendSpeech("status", "인식기: " + (recognizerService == null ? "기본" : recognizerService.getPackageName()));
         // 인식을 다시 시작할 때마다 나는 효과음을 녹음 중에는 끈다
         try {
             ((AudioManager) getSystemService(AUDIO_SERVICE)).adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0);
@@ -220,7 +241,9 @@ public class MainActivity extends Activity {
     private void listenOnce() {
         if (!listening) return;
         if (recognizer == null) {
-            recognizer = SpeechRecognizer.createSpeechRecognizer(this);
+            recognizer = recognizerService == null
+                    ? SpeechRecognizer.createSpeechRecognizer(this)
+                    : SpeechRecognizer.createSpeechRecognizer(this, recognizerService);
             recognizer.setRecognitionListener(new Listener());
         }
         Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
@@ -232,7 +255,27 @@ public class MainActivity extends Activity {
         try {
             recognizer.startListening(i);
         } catch (Exception e) {
+            sendSpeech("status", "시작 실패: " + e.getMessage());
             recreateAndRetry();
+        }
+    }
+
+    private static String errorName(int error) {
+        switch (error) {
+            case SpeechRecognizer.ERROR_NETWORK_TIMEOUT: return "1 네트워크 시간 초과";
+            case SpeechRecognizer.ERROR_NETWORK: return "2 네트워크";
+            case SpeechRecognizer.ERROR_AUDIO: return "3 오디오(마이크)";
+            case SpeechRecognizer.ERROR_SERVER: return "4 서버";
+            case SpeechRecognizer.ERROR_CLIENT: return "5 클라이언트";
+            case SpeechRecognizer.ERROR_SPEECH_TIMEOUT: return "6 말소리 없음";
+            case SpeechRecognizer.ERROR_NO_MATCH: return "7 인식 결과 없음";
+            case SpeechRecognizer.ERROR_RECOGNIZER_BUSY: return "8 인식기 사용 중";
+            case SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS: return "9 권한 없음";
+            case 10: return "10 너무 많은 요청";
+            case 11: return "11 서버 연결 끊김";
+            case 12: return "12 언어 미지원";
+            case 13: return "13 언어 사용 불가";
+            default: return String.valueOf(error);
         }
     }
 
@@ -250,8 +293,8 @@ public class MainActivity extends Activity {
     }
 
     private class Listener implements RecognitionListener {
-        @Override public void onReadyForSpeech(Bundle params) { }
-        @Override public void onBeginningOfSpeech() { }
+        @Override public void onReadyForSpeech(Bundle params) { sendSpeech("status", "듣는 중"); }
+        @Override public void onBeginningOfSpeech() { sendSpeech("status", "말소리 감지"); }
         @Override public void onRmsChanged(float rmsdB) { }
         @Override public void onBufferReceived(byte[] buffer) { }
         @Override public void onEndOfSpeech() { }
@@ -265,6 +308,7 @@ public class MainActivity extends Activity {
         @Override
         public void onResults(Bundle results) {
             audioErrors = 0;
+            errorsInRow = 0;
             if (!listening) return;
             sendSpeech("final", first(results));
             restartListening(50);
@@ -273,6 +317,14 @@ public class MainActivity extends Activity {
         @Override
         public void onError(int error) {
             if (!listening) return;
+            errorsInRow++;
+            sendSpeech("status", "오류 " + errorName(error) + " (연속 " + errorsInRow + "회)");
+            // 결과 없이 오류만 계속되면 포기하고 알린다
+            if (errorsInRow >= 12 && error != SpeechRecognizer.ERROR_SPEECH_TIMEOUT && error != SpeechRecognizer.ERROR_NO_MATCH) {
+                stopListening();
+                sendSpeech("fatal", "오류 " + errorName(error) + " 반복");
+                return;
+            }
             switch (error) {
                 case SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS:
                     stopListening();

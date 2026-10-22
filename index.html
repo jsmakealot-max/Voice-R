@@ -150,6 +150,7 @@ dialog label input, dialog label select { display: block; width: 100%; margin-to
   <div id="recbar">
     <span class="dot"></span>
     <span id="timer">00:00</span>
+    <span id="srStatus" style="font-size:12px;color:var(--sub)"></span>
     <div id="meter"><i></i></div>
     <button id="pauseBtn" disabled>일시정지</button>
     <button id="stopBtn" disabled>■ 녹음 종료</button>
@@ -552,6 +553,7 @@ function startRecog() {
   if (!rec || rec.recogOff || rec.paused) return;
   if (rec.mode === 'native') {
     rec.recog = 'native';
+    $('#srStatus').textContent = '음성 인식 시작…';
     window.AndroidBridge.startSpeech($('#lang').value);
     return;
   }
@@ -588,7 +590,7 @@ function startRecog() {
 function stopRecog() {
   if (!rec || !rec.recog) return;
   const r = rec.recog; rec.recog = null;
-  if (r === 'native') window.AndroidBridge.stopSpeech();
+  if (r === 'native') { window.AndroidBridge.stopSpeech(); $('#srStatus').textContent = ''; }
   else try { r.stop(); } catch (_) {}
   flushInterim();
 }
@@ -622,7 +624,10 @@ window.__nativeSpeech = (type, text) => {
       flushInterim(); // 확정 없이 끝나면 보이던 중간 결과를 그대로 남긴다
     }
   } else if (type === 'fatal') {
+    $('#srStatus').textContent = '중단: ' + text;
     recognizerFailed('폰 음성 인식', text);
+  } else if (type === 'status') {
+    $('#srStatus').textContent = text;
   }
 };
 function showInterim(text) {
