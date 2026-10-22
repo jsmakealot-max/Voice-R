@@ -14,7 +14,11 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.ParcelFileDescriptor;
+import android.media.AudioFormat;
 import android.media.AudioManager;
+import android.media.AudioRecord;
+import android.media.MediaRecorder;
 import android.provider.MediaStore;
 import android.speech.RecognitionListener;
 import android.speech.RecognizerIntent;
@@ -34,12 +38,17 @@ import android.webkit.WebViewClient;
 import org.json.JSONObject;
 
 import java.io.File;
+import java.io.BufferedOutputStream;
 import java.io.FileOutputStream;
+import java.io.RandomAccessFile;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 /** assets/www 의 웹앱을 보안 출처(https)로 띄우고 마이크·파일 선택·저장을 연결하는 화면. */
 public class MainActivity extends Activity {
@@ -47,6 +56,8 @@ public class MainActivity extends Activity {
     private static final String HOST = "appassets.androidplatform.net";
     private static final int REQ_FILE = 1;
     private static final int REQ_MIC = 2;
+    private static final int REQ_MIC_CAPTURE = 3;
+    private static final int RATE = 16000;
 
     private WebView web;
     private ValueCallback<Uri[]> fileCallback;
@@ -59,6 +70,19 @@ public class MainActivity extends Activity {
     private int errorsInRow;
     private boolean musicMuted;
     private ComponentName recognizerService;
+
+    // 앱이 직접 마이크를 잡아 녹음 파일과 음성 인식기 양쪽에 소리를 나눠 준다.
+    // (두 곳에서 따로 마이크를 열면 안드로이드가 한쪽에 무음을 준다)
+    private AudioRecord audio;
+    private Thread captureThread;
+    private volatile boolean capturing, capturePaused;
+    private File pcmFile;
+    private BlockingQueue<byte[]> feed;      // 인식기로 보낼 소리 (가득 차면 버린다)
+    private ParcelFileDescriptor pipeWrite;
+    private Thread feedThread;
+    private boolean usePipe;                 // 인식기에 파이프로 소리를 넣는 중
+    private boolean pipeProven;              // 파이프 방식이 이 기기에서 실제로 동작함
+    private Runnable readyTimeout;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -82,6 +106,14 @@ public class MainActivity extends Activity {
                 String path = u.getPath();
                 if (path == null || path.equals("/")) path = "/index.html";
                 if (path.contains("..")) return notFound();
+                if (path.startsWith("/__rec/")) {
+                    try {
+                        File f = new File(new File(getCacheDir(), "rec"), path.substring(7));
+                        return new WebResourceResponse("audio/wav", null, new java.io.FileInputStream(f));
+                    } catch (IOException e) {
+                        return notFound();
+                    }
+                }
                 try {
                     InputStream in = getAssets().open("www" + path);
                     return new WebResourceResponse(mimeOf(path), "utf-8", in);
@@ -146,6 +178,11 @@ public class MainActivity extends Activity {
 
     @Override
     public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
+        if (code == REQ_MIC_CAPTURE) {
+            if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) beginCapture();
+            else sendJs("__nativeCapture", "denied", "");
+            return;
+        }
         if (code != REQ_MIC || pendingPermission == null) return;
         if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) {
             pendingPermission.grant(new String[]{PermissionRequest.RESOURCE_AUDIO_CAPTURE});
@@ -171,8 +208,124 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         stopListening();
+        endCapture();
         web.destroy();
         super.onDestroy();
+    }
+
+    // ---------- 마이크 캡처 ----------
+
+    private void sendJs(String fn, String a, String b) {
+        final String js = "window." + fn + "&&window." + fn + "(" + JSONObject.quote(a) + "," + JSONObject.quote(b) + ")";
+        main.post(new Runnable() {
+            @Override
+            public void run() {
+                web.evaluateJavascript(js, null);
+            }
+        });
+    }
+
+    private void beginCapture() {
+        if (capturing) return;
+        try {
+            File dir = new File(getCacheDir(), "rec");
+            dir.mkdirs();
+            for (File f : dir.listFiles()) f.delete();
+            pcmFile = new File(dir, "current.pcm");
+            int min = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
+            audio = new AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, RATE, AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT, Math.max(min * 4, RATE * 2));
+            if (audio.getState() != AudioRecord.STATE_INITIALIZED) throw new IOException("마이크를 열 수 없습니다");
+            audio.startRecording();
+        } catch (Exception e) {
+            endCapture();
+            sendJs("__nativeCapture", "error", String.valueOf(e.getMessage()));
+            return;
+        }
+        capturing = true;
+        capturePaused = false;
+        captureThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                captureLoop();
+            }
+        }, "capture");
+        captureThread.start();
+        sendJs("__nativeCapture", "started", "");
+    }
+
+    private void captureLoop() {
+        BufferedOutputStream out = null;
+        try {
+            out = new BufferedOutputStream(new FileOutputStream(pcmFile), 1 << 16);
+            byte[] buf = new byte[RATE / 10 * 2]; // 0.1초
+            long lastLevel = 0;
+            while (capturing) {
+                int n = audio.read(buf, 0, buf.length);
+                if (n <= 0) continue;
+                if (capturePaused) continue;
+                out.write(buf, 0, n);
+                BlockingQueue<byte[]> q = feed;
+                if (q != null) {
+                    byte[] copy = new byte[n];
+                    System.arraycopy(buf, 0, copy, 0, n);
+                    q.offer(copy); // 인식기가 못 따라오면 그냥 버린다 — 녹음이 멈추면 안 되니까
+                }
+                long now = System.currentTimeMillis();
+                if (now - lastLevel >= 100) {
+                    lastLevel = now;
+                    int peak = 0;
+                    for (int i = 0; i + 1 < n; i += 2) {
+                        int v = (short) ((buf[i] & 0xff) | (buf[i + 1] << 8));
+                        if (v < 0) v = -v;
+                        if (v > peak) peak = v;
+                    }
+                    sendJs("__nativeLevel", String.valueOf(peak / 32768f), "");
+                }
+            }
+        } catch (IOException e) {
+            sendJs("__nativeCapture", "error", String.valueOf(e.getMessage()));
+        } finally {
+            try { if (out != null) out.close(); } catch (IOException ignored) { }
+        }
+    }
+
+    /** 캡처를 끝내고, 녹음된 소리가 있으면 웹앱이 가져갈 WAV 주소를 돌려준다. */
+    private String endCapture() {
+        capturing = false;
+        if (captureThread != null) {
+            try { captureThread.join(2000); } catch (InterruptedException ignored) { }
+            captureThread = null;
+        }
+        if (audio != null) {
+            try { audio.stop(); } catch (Exception ignored) { }
+            audio.release();
+            audio = null;
+        }
+        if (pcmFile == null || !pcmFile.exists() || pcmFile.length() == 0) return "";
+        try {
+            File wav = new File(pcmFile.getParentFile(), "rec-" + System.currentTimeMillis() + ".wav");
+            writeWav(pcmFile, wav);
+            pcmFile.delete();
+            pcmFile = null;
+            return "https://" + HOST + "/__rec/" + wav.getName();
+        } catch (IOException e) {
+            return "";
+        }
+    }
+
+    private static void writeWav(File pcm, File wav) throws IOException {
+        long len = pcm.length();
+        try (RandomAccessFile out = new RandomAccessFile(wav, "rw"); java.io.FileInputStream in = new java.io.FileInputStream(pcm)) {
+            java.nio.ByteBuffer h = java.nio.ByteBuffer.allocate(44).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            h.put("RIFF".getBytes()).putInt((int) (36 + len)).put("WAVE".getBytes());
+            h.put("fmt ".getBytes()).putInt(16).putShort((short) 1).putShort((short) 1).putInt(RATE).putInt(RATE * 2).putShort((short) 2).putShort((short) 16);
+            h.put("data".getBytes()).putInt((int) len);
+            out.write(h.array());
+            byte[] b = new byte[1 << 16];
+            int n;
+            while ((n = in.read(b)) > 0) out.write(b, 0, n);
+        }
     }
 
     // ---------- 폰 기본 음성 인식 ----------
@@ -214,7 +367,9 @@ public class MainActivity extends Activity {
 
     private void stopListening() {
         listening = false;
-        main.removeCallbacksAndMessages(null);
+        if (restartRunnable != null) main.removeCallbacks(restartRunnable);
+        cancelReadyTimeout();
+        closePipe();
         if (recognizer != null) {
             recognizer.destroy();
             recognizer = null;
@@ -228,14 +383,18 @@ public class MainActivity extends Activity {
         }
     }
 
+    private Runnable restartRunnable;
+
     private void restartListening(long delayMs) {
-        main.removeCallbacksAndMessages(null);
-        main.postDelayed(new Runnable() {
+        if (restartRunnable != null) main.removeCallbacks(restartRunnable);
+        restartRunnable = new Runnable() {
             @Override
             public void run() {
+                restartRunnable = null;
                 if (listening) listenOnce();
             }
-        }, delayMs);
+        };
+        main.postDelayed(restartRunnable, delayMs);
     }
 
     private void listenOnce() {
@@ -252,6 +411,25 @@ public class MainActivity extends Activity {
         i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
         i.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, getPackageName());
         i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L);
+        closePipe();
+        usePipe = capturing && Build.VERSION.SDK_INT >= 33;
+        if (usePipe) {
+            try {
+                ParcelFileDescriptor[] p = ParcelFileDescriptor.createPipe();
+                pipeWrite = p[1];
+                i.putExtra("android.speech.extra.AUDIO_SOURCE", p[0]);          // RecognizerIntent.EXTRA_AUDIO_SOURCE (API 33)
+                i.putExtra("android.speech.extra.AUDIO_SOURCE_CHANNEL_COUNT", 1);
+                i.putExtra("android.speech.extra.AUDIO_SOURCE_ENCODING", AudioFormat.ENCODING_PCM_16BIT);
+                i.putExtra("android.speech.extra.AUDIO_SOURCE_SAMPLING_RATE", RATE);
+                startFeeding();
+                if (!pipeProven) armReadyTimeout();
+            } catch (IOException e) {
+                usePipe = false;
+            }
+        } else if (capturing) {
+            // 파이프를 못 쓰는 기기: 인식기가 직접 마이크를 잡게 하고 녹음은 포기한다
+            giveMicToRecognizer();
+        }
         try {
             recognizer.startListening(i);
         } catch (Exception e) {
@@ -279,6 +457,61 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void startFeeding() {
+        feed = new ArrayBlockingQueue<byte[]>(40);
+        final BlockingQueue<byte[]> q = feed;
+        final ParcelFileDescriptor w = pipeWrite;
+        feedThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try (OutputStream out = new ParcelFileDescriptor.AutoCloseOutputStream(w)) {
+                    while (feed == q) {
+                        byte[] b = q.poll(200, TimeUnit.MILLISECONDS);
+                        if (b != null) out.write(b);
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+        }, "feed");
+        feedThread.start();
+    }
+
+    private void closePipe() {
+        feed = null;
+        pipeWrite = null; // 스트림이 닫히면서 fd도 닫힌다
+        feedThread = null;
+    }
+
+    /** 파이프로 넣은 소리를 인식기가 받는지 확인한다. 몇 초 안에 준비 신호가 없으면 안 되는 기기로 본다. */
+    private void armReadyTimeout() {
+        cancelReadyTimeout();
+        readyTimeout = new Runnable() {
+            @Override
+            public void run() {
+                readyTimeout = null;
+                if (!listening || pipeProven) return;
+                sendSpeech("status", "이 기기는 파이프 입력을 지원하지 않음 — 인식기가 마이크를 직접 사용");
+                giveMicToRecognizer();
+                recreateAndRetry();
+            }
+        };
+        main.postDelayed(readyTimeout, 6000);
+    }
+
+    private void cancelReadyTimeout() {
+        if (readyTimeout != null) {
+            main.removeCallbacks(readyTimeout);
+            readyTimeout = null;
+        }
+    }
+
+    private void giveMicToRecognizer() {
+        if (!capturing) return;
+        endCapture();
+        pcmFile = null;
+        sendJs("__nativeCapture", "noaudio", "");
+    }
+
     private void recreateAndRetry() {
         if (recognizer != null) {
             recognizer.destroy();
@@ -293,15 +526,16 @@ public class MainActivity extends Activity {
     }
 
     private class Listener implements RecognitionListener {
-        @Override public void onReadyForSpeech(Bundle params) { sendSpeech("status", "듣는 중"); }
+        @Override public void onReadyForSpeech(Bundle params) { sendSpeech("status", usePipe ? "듣는 중 (앱 마이크 공유)" : "듣는 중"); }
         @Override public void onBeginningOfSpeech() { sendSpeech("status", "말소리 감지"); }
-        @Override public void onRmsChanged(float rmsdB) { }
+        @Override public void onRmsChanged(float rmsDb) { if (usePipe && !pipeProven && rmsDb > 0) { pipeProven = true; cancelReadyTimeout(); } }
         @Override public void onBufferReceived(byte[] buffer) { }
         @Override public void onEndOfSpeech() { }
         @Override public void onEvent(int eventType, Bundle params) { }
 
         @Override
         public void onPartialResults(Bundle partial) {
+            if (usePipe) { pipeProven = true; cancelReadyTimeout(); }
             if (listening) sendSpeech("partial", first(partial));
         }
 
@@ -309,6 +543,7 @@ public class MainActivity extends Activity {
         public void onResults(Bundle results) {
             audioErrors = 0;
             errorsInRow = 0;
+            if (usePipe) { pipeProven = true; cancelReadyTimeout(); }
             if (!listening) return;
             sendSpeech("final", first(results));
             restartListening(50);
@@ -319,6 +554,16 @@ public class MainActivity extends Activity {
             if (!listening) return;
             errorsInRow++;
             sendSpeech("status", "오류 " + errorName(error) + " (연속 " + errorsInRow + "회)");
+            // 말소리 없음/결과 없음은 인식기가 소리를 받고 있다는 뜻이므로 파이프가 동작하는 것으로 본다
+            if (usePipe && (error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT || error == SpeechRecognizer.ERROR_NO_MATCH)) { pipeProven = true; cancelReadyTimeout(); }
+            // 파이프를 받다가 오류가 나면(지원 안 함 등) 인식기가 마이크를 직접 쓰게 한다
+            if (usePipe && !pipeProven && error != SpeechRecognizer.ERROR_SPEECH_TIMEOUT && error != SpeechRecognizer.ERROR_NO_MATCH) {
+                cancelReadyTimeout();
+                sendSpeech("status", "파이프 입력 실패(" + errorName(error) + ") — 인식기가 마이크를 직접 사용");
+                giveMicToRecognizer();
+                recreateAndRetry();
+                return;
+            }
             // 결과 없이 오류만 계속되면 포기하고 알린다
             if (errorsInRow >= 12 && error != SpeechRecognizer.ERROR_SPEECH_TIMEOUT && error != SpeechRecognizer.ERROR_NO_MATCH) {
                 stopListening();
@@ -393,6 +638,47 @@ public class MainActivity extends Activity {
                     startListening(lang);
                 }
             });
+        }
+
+        /** 앱이 마이크를 잡고 녹음을 시작한다. 결과는 __nativeCapture(started|denied|error|noaudio)로 알린다. */
+        @JavascriptInterface
+        public void startCapture() {
+            main.post(new Runnable() {
+                @Override
+                public void run() {
+                    pipeProven = false;
+                    if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) beginCapture();
+                    else requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_MIC_CAPTURE);
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void pauseCapture(boolean paused) {
+            capturePaused = paused;
+        }
+
+        /** 녹음을 끝내고 WAV 파일 주소(없으면 빈 문자열)를 돌려준다. */
+        @JavascriptInterface
+        public String stopCapture() {
+            final String[] url = {""};
+            final Object lock = new Object();
+            final boolean[] done = {false};
+            main.post(new Runnable() {
+                @Override
+                public void run() {
+                    stopListening();
+                    String u = endCapture();
+                    synchronized (lock) { url[0] = u; done[0] = true; lock.notifyAll(); }
+                }
+            });
+            synchronized (lock) {
+                long until = System.currentTimeMillis() + 5000;
+                while (!done[0] && System.currentTimeMillis() < until) {
+                    try { lock.wait(500); } catch (InterruptedException ignored) { }
+                }
+            }
+            return url[0];
         }
 
         @JavascriptInterface

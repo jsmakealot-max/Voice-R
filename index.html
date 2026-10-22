@@ -491,31 +491,51 @@ function makeNote(title) {
 }
 function elapsed() { return rec.acc + (rec.paused ? 0 : performance.now() - rec.since); }
 
+// 안드로이드 앱의 폰 음성 인식 모드: 앱이 마이크를 잡고 녹음과 인식을 함께 처리한다
+function nativeCaptureStart() {
+  return new Promise((resolve, reject) => {
+    window.__nativeCapture = (type, detail) => {
+      if (type === 'started') resolve();
+      else if (type === 'denied') reject(new Error('마이크 권한이 필요합니다'));
+      else if (type === 'error') reject(new Error(detail || '마이크를 열 수 없습니다'));
+      else if (type === 'noaudio' && rec) {
+        rec.noAudio = true;
+        toast('이 기기는 받아쓰기와 녹음 저장을 같이 할 수 없어, 이번에는 받아쓰기만 합니다');
+      }
+    };
+    window.AndroidBridge.startCapture();
+  });
+}
+window.__nativeLevel = v => { if (rec && !rec.paused) $('#meter i').style.width = Math.min(100, v * 220) + '%'; };
+
 $('#newRec').onclick = async () => {
   if (rec) return;
-  if (!navigator.mediaDevices || !window.MediaRecorder) return toast('이 브라우저는 녹음을 지원하지 않습니다');
-  let stream;
-  try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } }); }
-  catch (e) { return toast('마이크 권한이 필요합니다: ' + e.message); }
+  const mode = liveMode();
+  let stream = null, mr = null;
+  const chunks = [];
+  if (mode === 'native') {
+    try { await nativeCaptureStart(); } catch (e) { return toast(e.message); }
+  } else {
+    if (!navigator.mediaDevices || !window.MediaRecorder) return toast('이 브라우저는 녹음을 지원하지 않습니다');
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } }); }
+    catch (e) { return toast('마이크 권한이 필요합니다: ' + e.message); }
+    mr = new MediaRecorder(stream);
+    mr.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+    mr.start(1000);
+  }
 
   const note = makeNote(`${dateStr(Date.now())} 녹음`);
-
-  const mr = new MediaRecorder(stream);
-  const chunks = [];
-  mr.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
-  mr.start(1000);
 
   const interimEl = document.createElement('div');
   interimEl.className = 'seg interim';
   interimEl.style.display = 'none';
   interimEl.innerHTML = '<div class="who"></div><div class="txt"></div><span></span><div class="ts"></div>';
 
-  const mode = liveMode();
   rec = { note, stream, mr, chunks, acc: 0, since: performance.now(), paused: false, speaker: 0, spkLog: [{ t: 0, s: 0 }],
           mode, recog: null, recogOff: mode !== 'browser' && mode !== 'native', srErrors: 0, pendingStart: null, interimText: '', interimEl, live: null };
 
   // 마이크 입력 레벨 표시
-  try {
+  if (stream) try {
     const ctx = new AudioContext(), an = ctx.createAnalyser();
     an.fftSize = 512;
     const src = ctx.createMediaStreamSource(stream);
@@ -764,12 +784,14 @@ $('#pauseBtn').onclick = () => {
   if (!rec) return;
   if (rec.paused) {
     rec.paused = false; rec.since = performance.now();
-    rec.mr.resume(); startRecog();
+    if (rec.mr) rec.mr.resume(); else window.AndroidBridge.pauseCapture(false);
+    startRecog();
     $('#pauseBtn').textContent = '일시정지';
     document.body.classList.add('recording');
   } else {
     rec.acc = elapsed(); rec.paused = true;
-    rec.mr.pause(); stopRecog();
+    if (rec.mr) rec.mr.pause(); else window.AndroidBridge.pauseCapture(true);
+    stopRecog();
     flushLive(rec, true);
     $('#pauseBtn').textContent = '계속 녹음';
     document.body.classList.remove('recording');
@@ -785,16 +807,28 @@ $('#stopBtn').onclick = async () => {
   flushLive(r, true);
   if (r.live) r.live.proc.onaudioprocess = null;
   clearInterval(r.tick);
-  await new Promise(res => { r.mr.onstop = res; r.mr.stop(); });
-  r.stream.getTracks().forEach(t => t.stop());
+  let nativeUrl = '';
+  if (r.mr) {
+    await new Promise(res => { r.mr.onstop = res; r.mr.stop(); });
+    r.stream.getTracks().forEach(t => t.stop());
+  } else {
+    nativeUrl = window.AndroidBridge.stopCapture();
+  }
   if (r.ctx) r.ctx.close();
   rec = null;
   window.AndroidBridge?.keepAwake(false);
   if (r.live) liveStatus(r);
 
-  const mime = r.mr.mimeType || 'audio/webm';
-  r.note.audio = new Blob(r.chunks, { type: mime });
-  r.note.mime = mime;
+  if (r.mr) {
+    const mime = r.mr.mimeType || 'audio/webm';
+    r.note.audio = new Blob(r.chunks, { type: mime });
+    r.note.mime = mime;
+  } else if (nativeUrl) {
+    try {
+      r.note.audio = await (await fetch(nativeUrl)).blob();
+      r.note.mime = 'audio/wav';
+    } catch (_) { toast('녹음 파일을 가져오지 못했습니다'); }
+  }
   await dbPut(r.note).catch(e => toast('저장 실패: ' + e.message));
 
   document.body.classList.remove('recording');
@@ -803,7 +837,7 @@ $('#stopBtn').onclick = async () => {
   $('#pauseBtn').textContent = '일시정지';
   if (cur === r.note) openNote(r.note); else renderList();
   syncButtons();
-  toast('녹음을 저장했습니다');
+  toast(r.noAudio ? '받아쓰기만 저장했습니다 (이 기기는 녹음 파일을 함께 만들 수 없습니다)' : '녹음을 저장했습니다');
 };
 
 window.addEventListener('beforeunload', e => { if (rec) { e.preventDefault(); e.returnValue = ''; } });
