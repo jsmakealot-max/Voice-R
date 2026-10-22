@@ -913,6 +913,14 @@ $('#settings').addEventListener('close', () => {
     sttKey: $('#cfgSttKey').value.trim(), claudeKey: $('#cfgClaudeKey').value.trim(), liveMode: $('#cfgLive').value
   };
   try { localStorage.setItem('voicenote.cfg', JSON.stringify(cfg)); } catch (_) { toast('설정을 이 브라우저에 저장하지 못했습니다(이번 세션에만 적용)'); }
+  // 녹음 중에 키를 넣었으면 그 시점부터 AI 받아쓰기를 시작한다
+  if (rec && rec.mode === 'none' && rec.ctx && liveMode() === 'ai') {
+    rec.mode = 'ai';
+    startLiveAi(rec.ctx, rec.ctx.createMediaStreamSource(rec.stream));
+    if (cur === rec.note) renderSegs();
+    toast('지금부터 AI로 받아씁니다. 앞부분은 녹음 후 ‘AI 받아쓰기’로 변환하세요.');
+    return;
+  }
   toast('설정을 저장했습니다');
 });
 
