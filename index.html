@@ -210,6 +210,13 @@ dialog label input, dialog label select { display: block; width: 100%; margin-to
       <label>API 주소 <input id="cfgUrl" spellcheck="false"></label>
       <label>모델 <input id="cfgModel" spellcheck="false"></label>
       <label>API 키 <input id="cfgSttKey" type="password" autocomplete="off" spellcheck="false"></label>
+      <label>녹음 중 실시간 받아쓰기
+        <select id="cfgLive">
+          <option value="auto">자동 (브라우저 인식, 안 되면 AI)</option>
+          <option value="ai">항상 AI (더 정확, 사용량 과금)</option>
+          <option value="browser">브라우저 인식만 (무료)</option>
+        </select>
+      </label>
     </fieldset>
     <fieldset>
       <legend>AI 요약 (Claude)</legend>
@@ -223,7 +230,8 @@ dialog label input, dialog label select { display: block; width: 100%; margin-to
 <script>
 "use strict";
 const $ = s => document.querySelector(s);
-const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+// 안드로이드 웹뷰에는 음성 인식 객체가 있지만 실제로는 동작하지 않아 없는 것으로 본다
+const SR = window.AndroidBridge ? null : (window.SpeechRecognition || window.webkitSpeechRecognition);
 const SPK_COLORS = ['--s0', '--s1', '--s2', '--s3', '--s4', '--s5'];
 
 const SDK_URL = 'https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk@0.132.0/+esm';
@@ -384,14 +392,14 @@ $('#spkbtns').addEventListener('click', e => {
     cur.speakers.push(`참석자 ${cur.speakers.length + 1}`);
     saveSoon();
   } else if (rec) {
-    rec.speaker = +b.dataset.i;
+    setSpeaker(+b.dataset.i);
   }
   renderSpeakers();
 });
 document.addEventListener('keydown', e => {
   if (!rec || e.target.closest('input, textarea, [contenteditable]')) return;
   const i = +e.key - 1;
-  if (i >= 0 && i < cur.speakers.length) { rec.speaker = i; renderSpeakers(); }
+  if (i >= 0 && i < cur.speakers.length) { setSpeaker(i); renderSpeakers(); }
 });
 
 /* ---------- 음성 기록 ---------- */
@@ -410,8 +418,16 @@ function renderSegs() {
   const html = cur.segments.map((s, i) => ({ s, i }))
     .filter(({ s }) => (!only || s.star) && (!q || s.text.toLowerCase().includes(q.toLowerCase())))
     .map(({ s, i }) => segHtml(s, i, q)).join('');
-  box.innerHTML = html || `<div class="empty">${rec && rec.note === cur ? (SR ? '말씀하시면 여기에 받아쓰기가 표시됩니다…' : '실시간 받아쓰기를 지원하지 않는 환경이라 음성만 녹음합니다. 녹음이 끝나면 ‘AI 받아쓰기’로 글로 바꿀 수 있습니다.') : '표시할 기록이 없습니다.'}</div>`;
+  box.innerHTML = html || `<div class="empty">${emptyMessage(only, q)}</div>`;
   if (rec && rec.note === cur) box.appendChild(rec.interimEl);
+}
+function emptyMessage(only, q) {
+  if (cur.segments.length && only) return '북마크한 문장이 없습니다. ‘북마크만’을 끄면 전체 기록이 보입니다.';
+  if (cur.segments.length && q) return '검색 결과가 없습니다.';
+  if (!rec || rec.note !== cur) return '표시할 기록이 없습니다.';
+  if (rec.mode === 'browser') return '말씀하시면 여기에 받아쓰기가 표시됩니다…';
+  if (rec.mode === 'ai') return `AI가 약 ${LIVE_CHUNK_SEC}초마다 받아쓴 내용을 여기에 이어 붙입니다…`;
+  return '실시간 받아쓰기를 하려면 ⚙ 설정에 받아쓰기 API 키를 입력하세요. 지금은 음성만 녹음하며, 녹음 후 ‘AI 받아쓰기’로 바꿀 수 있습니다.';
 }
 $('#find').addEventListener('input', renderSegs);
 $('#onlyStar').addEventListener('change', renderSegs);
@@ -491,14 +507,17 @@ $('#newRec').onclick = async () => {
   interimEl.style.display = 'none';
   interimEl.innerHTML = '<div class="who"></div><div class="txt"></div><span></span><div class="ts"></div>';
 
-  rec = { note, stream, mr, chunks, acc: 0, since: performance.now(), paused: false, speaker: 0,
-          recog: null, recogOff: !SR, pendingStart: null, interimText: '', interimEl };
+  const mode = liveMode();
+  rec = { note, stream, mr, chunks, acc: 0, since: performance.now(), paused: false, speaker: 0, spkLog: [{ t: 0, s: 0 }],
+          mode, recog: null, recogOff: mode !== 'browser', srErrors: 0, pendingStart: null, interimText: '', interimEl, live: null };
 
   // 마이크 입력 레벨 표시
   try {
     const ctx = new AudioContext(), an = ctx.createAnalyser();
     an.fftSize = 512;
-    ctx.createMediaStreamSource(stream).connect(an);
+    const src = ctx.createMediaStreamSource(stream);
+    src.connect(an);
+    if (mode === 'ai') startLiveAi(ctx, src);
     const buf = new Uint8Array(an.fftSize);
     const loop = () => {
       if (!rec || rec.ctx !== ctx) return;
@@ -508,7 +527,9 @@ $('#newRec').onclick = async () => {
       requestAnimationFrame(loop);
     };
     rec.ctx = ctx; loop();
-  } catch (_) {}
+  } catch (_) {
+    if (rec.mode === 'ai') rec.mode = 'none';
+  }
 
   rec.tick = setInterval(() => {
     $('#timer').textContent = fmt(elapsed());
@@ -522,7 +543,7 @@ $('#newRec').onclick = async () => {
   $('#pauseBtn').textContent = '일시정지';
   openNote(note);
   save(note);
-  if (!SR) toast('이 환경은 실시간 받아쓰기를 지원하지 않아 음성만 녹음합니다. 녹음 후 ‘AI 받아쓰기’로 변환하세요.');
+  if (rec.mode === 'none') toast('실시간 받아쓰기 없이 음성만 녹음합니다. ⚙ 설정에 받아쓰기 API 키를 넣으면 AI로 받아씁니다.');
 };
 
 function startRecog() {
@@ -542,9 +563,20 @@ function startRecog() {
     showInterim(interim.trim());
   };
   r.onerror = e => {
-    if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+    if (!rec) return;
+    const fatal = e.error === 'not-allowed' || e.error === 'service-not-allowed' || e.error === 'audio-capture';
+    if (fatal || (e.error === 'network' && ++rec.srErrors >= 3)) {
       rec.recogOff = true;
-      toast('받아쓰기 서비스를 사용할 수 없어 음성만 녹음합니다');
+      // 브라우저 인식이 안 되면 키가 있을 때 AI 받아쓰기로 넘어간다
+      if (cfg.sttKey && cfg.liveMode !== 'browser' && rec.ctx) {
+        rec.mode = 'ai';
+        startLiveAi(rec.ctx, rec.ctx.createMediaStreamSource(rec.stream));
+        toast('브라우저 받아쓰기가 안 되어 AI 받아쓰기로 전환합니다');
+      } else {
+        rec.mode = 'none';
+        toast('받아쓰기를 사용할 수 없어 음성만 녹음합니다');
+      }
+      if (cur === rec.note) renderSegs();
     } else if (e.error === 'network') toast('받아쓰기 네트워크 오류 — 재연결 중…');
   };
   // 크롬은 일정 시간 무음이면 인식을 끝내므로 녹음 중엔 다시 시작
@@ -580,15 +612,116 @@ function flushInterim() {
   showInterim('');
 }
 function addSegment(t, text) {
-  const note = rec.note;
-  note.segments.push({ t: Math.round(t), text, speaker: rec.speaker, star: false });
+  addSegmentTo(rec.note, t, text, rec.speaker);
+  rec.interimText = '';
+}
+function addSegmentTo(note, t, text, speaker) {
+  note.segments.push({ t: Math.round(t), text, speaker, star: false });
   if (cur === note) {
     const q = $('#find').value.trim();
-    if (q || $('#onlyStar').checked || note.segments.length === 1) renderSegs();
+    const live = rec && rec.note === note;
+    if (!live || q || $('#onlyStar').checked || note.segments.length === 1) renderSegs();
     else rec.interimEl.insertAdjacentHTML('beforebegin', segHtml(note.segments[note.segments.length - 1], note.segments.length - 1, ''));
   }
-  rec.interimText = '';
-  saveSoon();
+  clearTimeout(note.saveT);
+  note.saveT = setTimeout(() => { delete note.saveT; save(note); renderList(); }, 600);
+}
+function setSpeaker(i) {
+  rec.speaker = i;
+  rec.spkLog.push({ t: elapsed(), s: i });
+}
+function speakerAt(log, t) {
+  let s = 0;
+  for (const e of log) if (e.t <= t) s = e.s;
+  return s;
+}
+
+/* ---------- AI 실시간 받아쓰기: 녹음 중 일정 길이마다 잘라 Whisper 호환 API로 보낸다 ---------- */
+const LIVE_CHUNK_SEC = 20;
+function liveMode() {
+  if (cfg.liveMode === 'browser') return SR ? 'browser' : 'none';
+  if (cfg.sttKey && (cfg.liveMode === 'ai' || !SR)) return 'ai';
+  return SR ? 'browser' : 'none';
+}
+function startLiveAi(ctx, src) {
+  const proc = ctx.createScriptProcessor(4096, 1, 1);
+  const L = rec.live = { rate: ctx.sampleRate, bufs: [], len: 0, start: null, pending: 0, queue: Promise.resolve(), proc };
+  const r = rec;
+  proc.onaudioprocess = e => {
+    if (rec !== r || r.paused || r.mode !== 'ai') return;
+    const d = e.inputBuffer.getChannelData(0);
+    if (L.start == null) L.start = Math.max(0, elapsed() - d.length / L.rate * 1000);
+    L.bufs.push(new Float32Array(d));
+    L.len += d.length;
+    if (L.len >= LIVE_CHUNK_SEC * L.rate) flushLive(r, false);
+  };
+  src.connect(proc);
+  proc.connect(ctx.destination); // 연결해야 처리가 돈다(출력은 무음)
+}
+function flushLive(r, final) {
+  const L = r.live;
+  if (!L || !L.len) return;
+  const all = new Float32Array(L.len);
+  let o = 0;
+  for (const b of L.bufs) { all.set(b, o); o += b.length; }
+  // 말이 끊긴 곳에서 자르도록 마지막 4초 중 가장 조용한 0.1초 지점을 찾는다
+  let cut = all.length;
+  if (!final) {
+    const win = Math.round(L.rate * 0.1), from = Math.max(0, all.length - L.rate * 4);
+    let best = Infinity;
+    for (let i = from; i + win <= all.length; i += win) {
+      let e = 0;
+      for (let j = i; j < i + win; j++) e += all[j] * all[j];
+      if (e < best) { best = e; cut = i + (win >> 1); }
+    }
+  }
+  const piece = all.subarray(0, cut), rest = all.slice(cut), startMs = L.start;
+  L.bufs = rest.length ? [rest] : [];
+  L.len = rest.length;
+  L.start = rest.length ? startMs + cut / L.rate * 1000 : null;
+
+  let energy = 0;
+  for (let i = 0; i < piece.length; i += 16) energy += piece[i] * piece[i];
+  // 너무 짧거나 거의 무음이면 보내지 않는다(무음에서 엉뚱한 문장이 나오는 것을 막음)
+  if (piece.length < L.rate * 0.8 || Math.sqrt(energy / (piece.length / 16)) < 0.004) return;
+
+  const wav = toWav(resample(piece, L.rate, RATE16));
+  const note = r.note, log = r.spkLog.slice();
+  L.pending++; liveStatus(r);
+  L.queue = L.queue
+    .then(() => sttRequest(wav, 'live.wav'))
+    .then(res => {
+      for (const s of sttSegments(res)) {
+        const t = startMs + s.start * 1000;
+        addSegmentTo(note, t, s.text, speakerAt(log, t));
+      }
+    })
+    .catch(e => toast('AI 받아쓰기 오류: ' + e.message))
+    .finally(() => { L.pending--; liveStatus(r); });
+}
+function liveStatus(r) {
+  const n = r.live.pending;
+  if (rec === r) {
+    const el = r.interimEl;
+    el.querySelector('.txt').textContent = n ? 'AI가 받아쓰는 중…' : '';
+    el.querySelector('.who').textContent = '';
+    el.querySelector('.ts').textContent = '';
+    el.style.display = n ? '' : 'none';
+  } else if (!job) {
+    setJob(n ? `남은 녹음을 받아쓰는 중… (${n})` : '');
+  }
+}
+function resample(pcm, from, to) {
+  if (from === to) return pcm;
+  const n = Math.floor(pcm.length * to / from), out = new Float32Array(n), k = from / to;
+  for (let i = 0; i < n; i++) {
+    // 간단한 구간 평균으로 줄인다
+    const a = Math.floor(i * k), b = Math.min(pcm.length, Math.max(a + 1, Math.floor((i + 1) * k)));
+    let sum = 0;
+    for (let j = a; j < b; j++) sum += pcm[j];
+    out[i] = sum / (b - a);
+  }
+  return out;
 }
 
 $('#pauseBtn').onclick = () => {
@@ -601,6 +734,7 @@ $('#pauseBtn').onclick = () => {
   } else {
     rec.acc = elapsed(); rec.paused = true;
     rec.mr.pause(); stopRecog();
+    flushLive(rec, true);
     $('#pauseBtn').textContent = '계속 녹음';
     document.body.classList.remove('recording');
   }
@@ -612,12 +746,15 @@ $('#stopBtn').onclick = async () => {
   stopRecog();
   r.note.duration = elapsed();
   r.recogOff = true;
+  flushLive(r, true);
+  if (r.live) r.live.proc.onaudioprocess = null;
   clearInterval(r.tick);
   await new Promise(res => { r.mr.onstop = res; r.mr.stop(); });
   r.stream.getTracks().forEach(t => t.stop());
   if (r.ctx) r.ctx.close();
   rec = null;
   window.AndroidBridge?.keepAwake(false);
+  if (r.live) liveStatus(r);
 
   const mime = r.mr.mimeType || 'audio/webm';
   r.note.audio = new Blob(r.chunks, { type: mime });
@@ -756,12 +893,12 @@ $('#delNote').onclick = async () => {
 
 /* ---------- AI 설정 ---------- */
 function loadCfg() {
-  const def = { sttProv: 'openai', sttUrl: STT_PRESETS.openai.url, sttModel: STT_PRESETS.openai.model, sttKey: '', claudeKey: '' };
+  const def = { sttProv: 'openai', sttUrl: STT_PRESETS.openai.url, sttModel: STT_PRESETS.openai.model, sttKey: '', claudeKey: '', liveMode: 'auto' };
   try { return Object.assign(def, JSON.parse(localStorage.getItem('voicenote.cfg') || '{}')); } catch (_) { return def; }
 }
 function openSettings() {
   $('#cfgProv').value = cfg.sttProv; $('#cfgUrl').value = cfg.sttUrl; $('#cfgModel').value = cfg.sttModel;
-  $('#cfgSttKey').value = cfg.sttKey; $('#cfgClaudeKey').value = cfg.claudeKey;
+  $('#cfgSttKey').value = cfg.sttKey; $('#cfgClaudeKey').value = cfg.claudeKey; $('#cfgLive').value = cfg.liveMode;
   $('#settings').showModal();
 }
 $('#setBtn').onclick = openSettings;
@@ -773,7 +910,7 @@ $('#settings').addEventListener('close', () => {
   if ($('#settings').returnValue !== 'ok') return;
   cfg = {
     sttProv: $('#cfgProv').value, sttUrl: $('#cfgUrl').value.trim().replace(/\/+$/, ''), sttModel: $('#cfgModel').value.trim(),
-    sttKey: $('#cfgSttKey').value.trim(), claudeKey: $('#cfgClaudeKey').value.trim()
+    sttKey: $('#cfgSttKey').value.trim(), claudeKey: $('#cfgClaudeKey').value.trim(), liveMode: $('#cfgLive').value
   };
   try { localStorage.setItem('voicenote.cfg', JSON.stringify(cfg)); } catch (_) { toast('설정을 이 브라우저에 저장하지 못했습니다(이번 세션에만 적용)'); }
   toast('설정을 저장했습니다');
@@ -834,6 +971,14 @@ async function sttRequest(blob, filename) {
   }
   return r.json();
 }
+// 응답에서 문장 목록을 꺼낸다. 말소리가 없다고 판단된 구간은 버린다
+function sttSegments(res) {
+  const list = res.segments && res.segments.length ? res.segments : [{ start: 0, text: res.text || '' }];
+  return list
+    .filter(s => !(s.no_speech_prob > 0.6 && (s.avg_logprob ?? 0) < -0.5))
+    .map(s => ({ start: s.start || 0, text: (s.text || '').trim() }))
+    .filter(s => s.text);
+}
 async function decode16k(blob) {
   // OfflineAudioContext로 디코딩하면 컨텍스트 샘플레이트(16kHz)로 변환된다
   const audio = await new OfflineAudioContext(1, 1, RATE16).decodeAudioData(await blob.arrayBuffer());
@@ -864,11 +1009,7 @@ async function transcribeNote(note) {
   try {
     const segs = [];
     const push = (res, offSec) => {
-      const list = res.segments && res.segments.length ? res.segments : [{ start: 0, text: res.text || '' }];
-      for (const s of list) {
-        const text = (s.text || '').trim();
-        if (text) segs.push({ t: Math.round((offSec + (s.start || 0)) * 1000), text, speaker: 0, star: false });
-      }
+      for (const s of sttSegments(res)) segs.push({ t: Math.round((offSec + s.start) * 1000), text: s.text, speaker: 0, star: false });
     };
     let durMs = 0;
     if (note.audio.size <= MAX_DIRECT) {
