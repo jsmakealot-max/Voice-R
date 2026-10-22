@@ -1,0 +1,5 @@
+android/build/
+android/out/
+*.p12
+*.jks
+*.keystore

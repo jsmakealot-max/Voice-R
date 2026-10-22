@@ -40,3 +40,27 @@
 - 25MB가 넘는 파일은 브라우저가 전체를 메모리에 풀어서 나누므로, 아주 긴 파일(수 시간)은 느리거나 실패할 수 있습니다.
 - 요약 탭의 키워드·핵심 문장은 AI 없이 기기에서 계산하는 간이 분석이고, `AI 요약`만 Claude를 사용합니다.
 - 브라우저 데이터를 삭제하면 노트도 함께 지워집니다. 중요한 기록은 TXT/음성 저장으로 백업하세요.
+
+## 안드로이드 앱 (APK)
+
+`android/` 폴더에 이 웹앱을 그대로 담은 안드로이드 앱이 있습니다(Android 7.0 이상).
+
+- 마이크 녹음, 음성 파일 올리기, AI 받아쓰기, AI 요약, TXT·녹음 파일 저장(다운로드/VoiceNote 폴더)이 됩니다.
+- **실시간 받아쓰기는 안 됩니다.** 안드로이드 웹뷰에는 브라우저 음성 인식이 없어서, 녹음만 한 뒤 `AI 받아쓰기`로 변환합니다.
+- 녹음 중에는 화면이 꺼지지 않게 유지합니다. 다른 앱으로 전환하면 녹음이 끊길 수 있습니다.
+- 앱 데이터는 앱 안에 따로 저장되며, 브라우저에서 쓰던 노트와 공유되지 않습니다.
+
+### 빌드
+
+Gradle 없이 `android/build.sh`로 만듭니다. 필요한 도구 경로를 환경 변수로 넘깁니다.
+
+```bash
+AAPT2=/path/to/aapt2 \
+ANDROID_JAR=$ANDROID_HOME/platforms/android-35/android.jar \
+DX_JAR=/path/to/dalvik-dx-16.0.1.jar \
+APKSIG_JAR=/path/to/apksig-2.3.0.jar \
+KEYSTORE=/path/to/voicenote-release.p12 KEY_PASS=... \
+./android/build.sh
+```
+
+결과는 `android/out/VoiceNote.apk`입니다. 앱을 업데이트하려면 처음 설치한 APK와 **같은 서명 키**로 빌드해야 합니다. 서명 키는 저장소에 넣지 마세요.

@@ -410,7 +410,7 @@ function renderSegs() {
   const html = cur.segments.map((s, i) => ({ s, i }))
     .filter(({ s }) => (!only || s.star) && (!q || s.text.toLowerCase().includes(q.toLowerCase())))
     .map(({ s, i }) => segHtml(s, i, q)).join('');
-  box.innerHTML = html || `<div class="empty">${rec && rec.note === cur ? (SR ? '말씀하시면 여기에 받아쓰기가 표시됩니다…' : '이 브라우저는 실시간 받아쓰기를 지원하지 않아 음성만 녹음됩니다. (Chrome/Edge 권장)') : '표시할 기록이 없습니다.'}</div>`;
+  box.innerHTML = html || `<div class="empty">${rec && rec.note === cur ? (SR ? '말씀하시면 여기에 받아쓰기가 표시됩니다…' : '실시간 받아쓰기를 지원하지 않는 환경이라 음성만 녹음합니다. 녹음이 끝나면 ‘AI 받아쓰기’로 글로 바꿀 수 있습니다.') : '표시할 기록이 없습니다.'}</div>`;
   if (rec && rec.note === cur) box.appendChild(rec.interimEl);
 }
 $('#find').addEventListener('input', renderSegs);
@@ -516,12 +516,13 @@ $('#newRec').onclick = async () => {
   }, 250);
 
   startRecog();
+  window.AndroidBridge?.keepAwake(true);
   document.body.classList.add('recording');
   $('#newRec').disabled = true; $('#pauseBtn').disabled = false; $('#stopBtn').disabled = false; $('#lang').disabled = true;
   $('#pauseBtn').textContent = '일시정지';
   openNote(note);
   save(note);
-  if (!SR) toast('실시간 받아쓰기는 Chrome 또는 Edge에서 지원됩니다. 음성만 녹음합니다.');
+  if (!SR) toast('이 환경은 실시간 받아쓰기를 지원하지 않아 음성만 녹음합니다. 녹음 후 ‘AI 받아쓰기’로 변환하세요.');
 };
 
 function startRecog() {
@@ -616,6 +617,7 @@ $('#stopBtn').onclick = async () => {
   r.stream.getTracks().forEach(t => t.stop());
   if (r.ctx) r.ctx.close();
   rec = null;
+  window.AndroidBridge?.keepAwake(false);
 
   const mime = r.mr.mimeType || 'audio/webm';
   r.note.audio = new Blob(r.chunks, { type: mime });
@@ -719,6 +721,17 @@ $('#pane-sum').addEventListener('click', e => {
 
 /* ---------- 내보내기 · 삭제 ---------- */
 function download(blob, name) {
+  // 안드로이드 앱(웹뷰)에서는 a.download가 동작하지 않아 앱에 저장을 맡긴다
+  if (window.AndroidBridge) {
+    const r = new FileReader();
+    r.onload = () => {
+      const res = window.AndroidBridge.saveFile(name, blob.type || 'application/octet-stream', r.result.split(',')[1]);
+      toast(res.startsWith('ERROR:') ? '저장 실패: ' + res.slice(6) : '저장했습니다: ' + res);
+    };
+    r.onerror = () => toast('파일을 읽지 못했습니다');
+    r.readAsDataURL(blob);
+    return;
+  }
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob); a.download = name; a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
