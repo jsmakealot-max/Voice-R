@@ -10,7 +10,13 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
+import android.media.AudioManager;
 import android.provider.MediaStore;
+import android.speech.RecognitionListener;
+import android.speech.RecognizerIntent;
+import android.speech.SpeechRecognizer;
 import android.util.Base64;
 import android.view.WindowManager;
 import android.webkit.JavascriptInterface;
@@ -23,11 +29,14 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 
+import org.json.JSONObject;
+
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.ArrayList;
 
 /** assets/www 의 웹앱을 보안 출처(https)로 띄우고 마이크·파일 선택·저장을 연결하는 화면. */
 public class MainActivity extends Activity {
@@ -39,6 +48,12 @@ public class MainActivity extends Activity {
     private WebView web;
     private ValueCallback<Uri[]> fileCallback;
     private PermissionRequest pendingPermission;
+    private final Handler main = new Handler(Looper.getMainLooper());
+    private SpeechRecognizer recognizer;
+    private boolean listening;
+    private String speechLang = "ko-KR";
+    private int audioErrors;
+    private boolean musicMuted;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -150,8 +165,148 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        stopListening();
         web.destroy();
         super.onDestroy();
+    }
+
+    // ---------- 폰 기본 음성 인식 ----------
+    // SpeechRecognizer는 한 번에 한 문장만 듣고 끝나므로, 녹음하는 동안 계속 다시 시작한다.
+
+    private void sendSpeech(String type, String text) {
+        web.evaluateJavascript("window.__nativeSpeech&&window.__nativeSpeech("
+                + JSONObject.quote(type) + "," + JSONObject.quote(text == null ? "" : text) + ")", null);
+    }
+
+    private void startListening(String lang) {
+        speechLang = lang;
+        listening = true;
+        audioErrors = 0;
+        // 인식을 다시 시작할 때마다 나는 효과음을 녹음 중에는 끈다
+        try {
+            ((AudioManager) getSystemService(AUDIO_SERVICE)).adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0);
+            musicMuted = true;
+        } catch (Exception ignored) {
+        }
+        listenOnce();
+    }
+
+    private void stopListening() {
+        listening = false;
+        main.removeCallbacksAndMessages(null);
+        if (recognizer != null) {
+            recognizer.destroy();
+            recognizer = null;
+        }
+        if (musicMuted) {
+            try {
+                ((AudioManager) getSystemService(AUDIO_SERVICE)).adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0);
+            } catch (Exception ignored) {
+            }
+            musicMuted = false;
+        }
+    }
+
+    private void restartListening(long delayMs) {
+        main.removeCallbacksAndMessages(null);
+        main.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (listening) listenOnce();
+            }
+        }, delayMs);
+    }
+
+    private void listenOnce() {
+        if (!listening) return;
+        if (recognizer == null) {
+            recognizer = SpeechRecognizer.createSpeechRecognizer(this);
+            recognizer.setRecognitionListener(new Listener());
+        }
+        Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, speechLang);
+        i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
+        i.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, getPackageName());
+        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L);
+        try {
+            recognizer.startListening(i);
+        } catch (Exception e) {
+            recreateAndRetry();
+        }
+    }
+
+    private void recreateAndRetry() {
+        if (recognizer != null) {
+            recognizer.destroy();
+            recognizer = null;
+        }
+        restartListening(500);
+    }
+
+    private static String first(Bundle b) {
+        ArrayList<String> list = b == null ? null : b.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+        return list == null || list.isEmpty() ? "" : list.get(0);
+    }
+
+    private class Listener implements RecognitionListener {
+        @Override public void onReadyForSpeech(Bundle params) { }
+        @Override public void onBeginningOfSpeech() { }
+        @Override public void onRmsChanged(float rmsdB) { }
+        @Override public void onBufferReceived(byte[] buffer) { }
+        @Override public void onEndOfSpeech() { }
+        @Override public void onEvent(int eventType, Bundle params) { }
+
+        @Override
+        public void onPartialResults(Bundle partial) {
+            if (listening) sendSpeech("partial", first(partial));
+        }
+
+        @Override
+        public void onResults(Bundle results) {
+            audioErrors = 0;
+            if (!listening) return;
+            sendSpeech("final", first(results));
+            restartListening(50);
+        }
+
+        @Override
+        public void onError(int error) {
+            if (!listening) return;
+            switch (error) {
+                case SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS:
+                    stopListening();
+                    sendSpeech("fatal", "권한 없음");
+                    return;
+                case 12: // ERROR_LANGUAGE_NOT_SUPPORTED
+                case 13: // ERROR_LANGUAGE_UNAVAILABLE
+                    stopListening();
+                    sendSpeech("fatal", "이 언어를 지원하지 않음");
+                    return;
+                case SpeechRecognizer.ERROR_AUDIO:
+                    // 마이크를 녹음과 함께 쓸 수 없는 기기
+                    if (++audioErrors >= 3) {
+                        stopListening();
+                        sendSpeech("fatal", "녹음 중 마이크를 함께 쓸 수 없음");
+                        return;
+                    }
+                    recreateAndRetry();
+                    return;
+                case SpeechRecognizer.ERROR_RECOGNIZER_BUSY:
+                case SpeechRecognizer.ERROR_CLIENT:
+                    recreateAndRetry();
+                    return;
+                case SpeechRecognizer.ERROR_NETWORK:
+                case SpeechRecognizer.ERROR_NETWORK_TIMEOUT:
+                case SpeechRecognizer.ERROR_SERVER:
+                    sendSpeech("final", "");
+                    restartListening(1500);
+                    return;
+                default: // 말이 없어서 끝난 경우 등
+                    sendSpeech("final", "");
+                    restartListening(50);
+            }
+        }
     }
 
     private static WebResourceResponse notFound() {
@@ -172,6 +327,32 @@ public class MainActivity extends Activity {
 
     /** 웹앱에서 window.AndroidBridge 로 부르는 기능. */
     private class Bridge {
+        @JavascriptInterface
+        public boolean speechAvailable() {
+            return SpeechRecognizer.isRecognitionAvailable(MainActivity.this);
+        }
+
+        @JavascriptInterface
+        public void startSpeech(final String lang) {
+            main.post(new Runnable() {
+                @Override
+                public void run() {
+                    stopListening();
+                    startListening(lang);
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void stopSpeech() {
+            main.post(new Runnable() {
+                @Override
+                public void run() {
+                    stopListening();
+                }
+            });
+        }
+
         /** 녹음 중 화면이 꺼져 마이크가 끊기지 않도록 한다. */
         @JavascriptInterface
         public void keepAwake(final boolean on) {

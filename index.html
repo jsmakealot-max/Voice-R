@@ -212,9 +212,9 @@ dialog label input, dialog label select { display: block; width: 100%; margin-to
       <label>API 키 <input id="cfgSttKey" type="password" autocomplete="off" spellcheck="false"></label>
       <label>녹음 중 실시간 받아쓰기
         <select id="cfgLive">
-          <option value="auto">자동 (브라우저 인식, 안 되면 AI)</option>
+          <option value="auto">자동 (무료 음성 인식, 안 되면 AI)</option>
           <option value="ai">항상 AI (더 정확, 사용량 과금)</option>
-          <option value="browser">브라우저 인식만 (무료)</option>
+          <option value="browser">무료 음성 인식만</option>
         </select>
       </label>
     </fieldset>
@@ -232,6 +232,8 @@ dialog label input, dialog label select { display: block; width: 100%; margin-to
 const $ = s => document.querySelector(s);
 // 안드로이드 웹뷰에는 음성 인식 객체가 있지만 실제로는 동작하지 않아 없는 것으로 본다
 const SR = window.AndroidBridge ? null : (window.SpeechRecognition || window.webkitSpeechRecognition);
+// 안드로이드 앱에서는 대신 폰의 기본 음성 인식(SpeechRecognizer)을 앱이 연결해 준다
+const NATIVE_SR = !!(window.AndroidBridge && window.AndroidBridge.speechAvailable && window.AndroidBridge.speechAvailable());
 const SPK_COLORS = ['--s0', '--s1', '--s2', '--s3', '--s4', '--s5'];
 
 const SDK_URL = 'https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk@0.132.0/+esm';
@@ -425,7 +427,7 @@ function emptyMessage(only, q) {
   if (cur.segments.length && only) return '북마크한 문장이 없습니다. ‘북마크만’을 끄면 전체 기록이 보입니다.';
   if (cur.segments.length && q) return '검색 결과가 없습니다.';
   if (!rec || rec.note !== cur) return '표시할 기록이 없습니다.';
-  if (rec.mode === 'browser') return '말씀하시면 여기에 받아쓰기가 표시됩니다…';
+  if (rec.mode === 'browser' || rec.mode === 'native') return '말씀하시면 여기에 받아쓰기가 표시됩니다…';
   if (rec.mode === 'ai') return `AI가 약 ${LIVE_CHUNK_SEC}초마다 받아쓴 내용을 여기에 이어 붙입니다…`;
   return '실시간 받아쓰기를 하려면 ⚙ 설정에 받아쓰기 API 키를 입력하세요. 지금은 음성만 녹음하며, 녹음 후 ‘AI 받아쓰기’로 바꿀 수 있습니다.';
 }
@@ -509,7 +511,7 @@ $('#newRec').onclick = async () => {
 
   const mode = liveMode();
   rec = { note, stream, mr, chunks, acc: 0, since: performance.now(), paused: false, speaker: 0, spkLog: [{ t: 0, s: 0 }],
-          mode, recog: null, recogOff: mode !== 'browser', srErrors: 0, pendingStart: null, interimText: '', interimEl, live: null };
+          mode, recog: null, recogOff: mode !== 'browser' && mode !== 'native', srErrors: 0, pendingStart: null, interimText: '', interimEl, live: null };
 
   // 마이크 입력 레벨 표시
   try {
@@ -543,11 +545,16 @@ $('#newRec').onclick = async () => {
   $('#pauseBtn').textContent = '일시정지';
   openNote(note);
   save(note);
-  if (rec.mode === 'none') toast('실시간 받아쓰기 없이 음성만 녹음합니다. ⚙ 설정에 받아쓰기 API 키를 넣으면 AI로 받아씁니다.');
+  if (rec.mode === 'none') toast('이 기기에서 쓸 수 있는 음성 인식이 없어 음성만 녹음합니다. ⚙ 설정에 받아쓰기 API 키를 넣으면 AI로 받아씁니다.');
 };
 
 function startRecog() {
   if (!rec || rec.recogOff || rec.paused) return;
+  if (rec.mode === 'native') {
+    rec.recog = 'native';
+    window.AndroidBridge.startSpeech($('#lang').value);
+    return;
+  }
   const r = new SR();
   r.lang = $('#lang').value; r.continuous = true; r.interimResults = true;
   r.onresult = e => {
@@ -565,19 +572,8 @@ function startRecog() {
   r.onerror = e => {
     if (!rec) return;
     const fatal = e.error === 'not-allowed' || e.error === 'service-not-allowed' || e.error === 'audio-capture';
-    if (fatal || (e.error === 'network' && ++rec.srErrors >= 3)) {
-      rec.recogOff = true;
-      // 브라우저 인식이 안 되면 키가 있을 때 AI 받아쓰기로 넘어간다
-      if (cfg.sttKey && cfg.liveMode !== 'browser' && rec.ctx) {
-        rec.mode = 'ai';
-        startLiveAi(rec.ctx, rec.ctx.createMediaStreamSource(rec.stream));
-        toast('브라우저 받아쓰기가 안 되어 AI 받아쓰기로 전환합니다');
-      } else {
-        rec.mode = 'none';
-        toast('받아쓰기를 사용할 수 없어 음성만 녹음합니다');
-      }
-      if (cur === rec.note) renderSegs();
-    } else if (e.error === 'network') toast('받아쓰기 네트워크 오류 — 재연결 중…');
+    if (fatal || (e.error === 'network' && ++rec.srErrors >= 3)) recognizerFailed('브라우저 받아쓰기');
+    else if (e.error === 'network') toast('받아쓰기 네트워크 오류 — 재연결 중…');
   };
   // 크롬은 일정 시간 무음이면 인식을 끝내므로 녹음 중엔 다시 시작
   r.onend = () => {
@@ -592,9 +588,43 @@ function startRecog() {
 function stopRecog() {
   if (!rec || !rec.recog) return;
   const r = rec.recog; rec.recog = null;
-  try { r.stop(); } catch (_) {}
+  if (r === 'native') window.AndroidBridge.stopSpeech();
+  else try { r.stop(); } catch (_) {}
   flushInterim();
 }
+// 무료 인식이 안 되면 키가 있을 때 AI 받아쓰기로 넘어가고, 없으면 녹음만 한다
+function recognizerFailed(what, detail) {
+  stopRecog();
+  rec.recogOff = true;
+  if (cfg.sttKey && cfg.liveMode !== 'browser' && rec.ctx) {
+    rec.mode = 'ai';
+    startLiveAi(rec.ctx, rec.ctx.createMediaStreamSource(rec.stream));
+    toast(`${what}: 사용할 수 없어 AI 받아쓰기로 전환합니다`);
+  } else {
+    rec.mode = 'none';
+    toast(`${what}: 사용할 수 없어 음성만 녹음합니다${detail ? ` (${detail})` : ''}`);
+  }
+  if (cur === rec.note) renderSegs();
+}
+// 안드로이드 앱이 음성 인식 결과를 넘겨주는 함수
+window.__nativeSpeech = (type, text) => {
+  if (!rec || rec.recog !== 'native') return;
+  if (type === 'partial') {
+    if (!text) return;
+    if (rec.pendingStart == null) rec.pendingStart = Math.max(0, elapsed() - 800);
+    showInterim(text);
+  } else if (type === 'final') {
+    if (text) {
+      addSegment(rec.pendingStart ?? Math.max(0, elapsed() - 1500), text);
+      rec.pendingStart = null;
+      showInterim('');
+    } else {
+      flushInterim(); // 확정 없이 끝나면 보이던 중간 결과를 그대로 남긴다
+    }
+  } else if (type === 'fatal') {
+    recognizerFailed('폰 음성 인식', text);
+  }
+};
 function showInterim(text) {
   rec.interimText = text;
   const el = rec.interimEl;
@@ -639,9 +669,10 @@ function speakerAt(log, t) {
 /* ---------- AI 실시간 받아쓰기: 녹음 중 일정 길이마다 잘라 Whisper 호환 API로 보낸다 ---------- */
 const LIVE_CHUNK_SEC = 20;
 function liveMode() {
-  if (cfg.liveMode === 'browser') return SR ? 'browser' : 'none';
-  if (cfg.sttKey && (cfg.liveMode === 'ai' || !SR)) return 'ai';
-  return SR ? 'browser' : 'none';
+  const free = SR ? 'browser' : NATIVE_SR ? 'native' : null;
+  if (cfg.liveMode === 'browser') return free || 'none';
+  if (cfg.sttKey && (cfg.liveMode === 'ai' || !free)) return 'ai';
+  return free || 'none';
 }
 function startLiveAi(ctx, src) {
   const proc = ctx.createScriptProcessor(4096, 1, 1);
